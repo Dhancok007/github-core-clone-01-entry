@@ -164,6 +164,27 @@ function writePackHeaderEntry(out, typeCode, size) {
   out.push(Buffer.from(bytes));
 }
 
+/**
+ * Packets of a pack entry (type/size header + deflated body) are a pure
+ * function of the object's content, and objects are immutable, so they are
+ * cached by object id: a fetch that packs the same objects twice pays the
+ * deflate cost once. The cache is bounded and simply cleared when full.
+ */
+const packEntryCache = new Map();
+const PACK_ENTRY_CACHE_MAX = 8192;
+
+function packEntryBytes(oid, type, data) {
+  let entry = packEntryCache.get(oid);
+  if (entry === undefined) {
+    const entryHeader = [];
+    writePackHeaderEntry(entryHeader, TYPE_CODE[type], data.length);
+    entry = Buffer.concat([...entryHeader, deflateSync(data)]);
+    if (packEntryCache.size >= PACK_ENTRY_CACHE_MAX) packEntryCache.clear();
+    packEntryCache.set(oid, entry);
+  }
+  return entry;
+}
+
 /** A version-2 pack of whole objects (no deltas), with a valid trailer. */
 export function writePack(objects) {
   const parts = [];
@@ -173,10 +194,7 @@ export function writePack(objects) {
   header.writeUInt32BE(objects.length, 8);
   parts.push(header);
   for (const object of objects) {
-    const entryHeader = [];
-    writePackHeaderEntry(entryHeader, TYPE_CODE[object.type], object.data.length);
-    parts.push(...entryHeader);
-    parts.push(deflateSync(object.data));
+    parts.push(packEntryBytes(hashObject(object.type, object.data), object.type, object.data));
   }
   const body = Buffer.concat(parts);
   const trailer = createHash('sha1').update(body).digest();

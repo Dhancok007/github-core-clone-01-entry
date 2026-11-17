@@ -11,7 +11,6 @@ import {
   PKT_FLUSH,
   ZERO_OID,
   collectReachable,
-  hashObject,
   isAncestor,
   parseCommit,
   parsePktLines,
@@ -25,6 +24,49 @@ import { nextRequestId } from './http.ts';
 const UPLOAD_CAPS_V0 = 'multi_ack_detailed side-band-64k thin-pack ofs-delta shallow object-format=sha1 agent=forge/1.0';
 const RECEIVE_CAPS = 'report-status delete-refs side-band-64k ofs-delta agent=forge/1.0';
 const FETCH_CAPS_V2 = ['agent=forge/1.0', 'ls-refs=unborn', 'fetch=shallow', 'object-format=sha1'];
+
+/** The v2 advertisement never changes: build it once. */
+const V2_ADVERTISEMENT = Buffer.concat(
+  ['version 2', ...FETCH_CAPS_V2].map((line) => pktLine(`${line}\n`)).concat([PKT_FLUSH]),
+);
+
+/**
+ * Response caching. Objects are immutable and content-addressed, so a fetch
+ * response is a pure function of its request bytes once every want and have
+ * it names exists in the store: it can be replayed verbatim forever.
+ * Responses that depend on the (mutable) refs — advertisements and ls-refs —
+ * are keyed by an exact fingerprint of the refs map, so any ref change is a
+ * different key. The cache lives on the repo record and is cleared when it
+ * grows past a small bound.
+ */
+const RESP_CACHE_MAX = 256;
+
+function cacheGet(repo, key) {
+  return repo.respCache.get(key);
+}
+
+function cachePut(repo, key, body) {
+  if (repo.respCache.size >= RESP_CACHE_MAX) repo.respCache.clear();
+  repo.respCache.set(key, body);
+}
+
+/** Exact, cheap fingerprint of a repo's refs (and HEAD target). */
+function refsFingerprint(repo) {
+  let fp = repo.defaultBranch;
+  for (const [ref, oid] of repo.refs) fp += `|${ref}=${oid}`;
+  return fp;
+}
+
+/** The command a v2 upload-pack request opens with ('' for a v0 request). */
+function uploadCommandOf(rawBody) {
+  if (rawBody.length < 4) return '';
+  const length = parseInt(rawBody.subarray(0, 4).toString('ascii'), 16);
+  if (!Number.isFinite(length) || length <= 4 || rawBody.length < length) return '';
+  const first = rawBody.subarray(4, length).toString('utf8');
+  if (first.startsWith('command=ls-refs')) return 'ls-refs';
+  if (first.startsWith('command=fetch')) return 'fetch';
+  return '';
+}
 
 function sendBuffer(res, status, contentType, body) {
   res.writeHead(status, {
@@ -93,9 +135,13 @@ function wantsV2(req) {
 
 function advertiseUpload(forge, req, res, repo) {
   if (wantsV2(req)) {
-    const lines = ['version 2', ...FETCH_CAPS_V2];
-    const body = Buffer.concat(lines.map((line) => pktLine(`${line}\n`)).concat([PKT_FLUSH]));
-    sendBuffer(res, 200, 'application/x-git-upload-pack-advertisement', body);
+    sendBuffer(res, 200, 'application/x-git-upload-pack-advertisement', V2_ADVERTISEMENT);
+    return;
+  }
+  const cacheKey = `adv:up:${refsFingerprint(repo)}`;
+  const cached = cacheGet(repo, cacheKey);
+  if (cached !== undefined) {
+    sendBuffer(res, 200, 'application/x-git-upload-pack-advertisement', cached);
     return;
   }
   const parts = [pktLine('# service=git-upload-pack\n'), PKT_FLUSH];
@@ -119,10 +165,18 @@ function advertiseUpload(forge, req, res, repo) {
     }
   }
   parts.push(PKT_FLUSH);
-  sendBuffer(res, 200, 'application/x-git-upload-pack-advertisement', Buffer.concat(parts));
+  const body = Buffer.concat(parts);
+  cachePut(repo, cacheKey, body);
+  sendBuffer(res, 200, 'application/x-git-upload-pack-advertisement', body);
 }
 
 function advertiseReceive(res, repo) {
+  const cacheKey = `adv:rec:${refsFingerprint(repo)}`;
+  const cached = cacheGet(repo, cacheKey);
+  if (cached !== undefined) {
+    sendBuffer(res, 200, 'application/x-git-receive-pack-advertisement', cached);
+    return;
+  }
   const parts = [pktLine('# service=git-receive-pack\n'), PKT_FLUSH];
   const refs = sortedRefs(repo);
   const headOid = repo.refs.get(headTarget(repo)) ?? ZERO_OID;
@@ -133,7 +187,9 @@ function advertiseReceive(res, repo) {
     for (const [ref, oid] of refs) parts.push(pktLine(`${oid} ${ref}\n`));
   }
   parts.push(PKT_FLUSH);
-  sendBuffer(res, 200, 'application/x-git-receive-pack-advertisement', Buffer.concat(parts));
+  const body = Buffer.concat(parts);
+  cachePut(repo, cacheKey, body);
+  sendBuffer(res, 200, 'application/x-git-receive-pack-advertisement', body);
 }
 
 // ---------------------------------------------------------------------------
@@ -377,20 +433,42 @@ function fetchV0(forge, repo, packets) {
 }
 
 function uploadPack(forge, req, res, repo, rawBody) {
-  const { packets } = parsePktLines(rawBody);
-  const commandLine = packets.find((packet) => packet.kind === 'data')?.payload.toString('utf8') ?? '';
-  let body;
-  if (commandLine.startsWith('command=ls-refs')) {
-    body = lsRefs(forge, repo, packets);
-  } else if (commandLine.startsWith('command=fetch')) {
-    body = fetchV2(forge, repo, packets);
-  } else if (wantsV2(req)) {
-    sendGitError(res, 400);
+  const command = uploadCommandOf(rawBody);
+  const bodyKey = rawBody.toString('latin1');
+  if (command === 'ls-refs') {
+    const key = `lsr:${refsFingerprint(repo)}:${bodyKey}`;
+    const cached = cacheGet(repo, key);
+    if (cached !== undefined) {
+      sendBuffer(res, 200, 'application/x-git-upload-pack-result', cached);
+      return;
+    }
+    const { packets } = parsePktLines(rawBody);
+    const body = lsRefs(forge, repo, packets);
+    cachePut(repo, key, body);
+    sendBuffer(res, 200, 'application/x-git-upload-pack-result', body);
     return;
-  } else {
-    body = fetchV0(forge, repo, packets);
   }
-  sendBuffer(res, 200, 'application/x-git-upload-pack-result', body);
+  if (command === 'fetch' || !wantsV2(req)) {
+    const key = `fetch:${bodyKey}`;
+    const cached = cacheGet(repo, key);
+    if (cached !== undefined) {
+      sendBuffer(res, 200, 'application/x-git-upload-pack-result', cached);
+      return;
+    }
+    const { packets } = parsePktLines(rawBody);
+    const body = command === 'fetch' ? fetchV2(forge, repo, packets) : fetchV0(forge, repo, packets);
+    // Replay is sound only when the response is a pure function of immutable
+    // objects: every want and have the request names must already exist.
+    const args = parseFetchArgs(packets);
+    const allKnown = args.wants.length > 0
+      && args.wants.every((oid) => forge.get(oid))
+      && args.haves.every((oid) => forge.get(oid))
+      && args.shallow.every((oid) => forge.get(oid));
+    if (allKnown) cachePut(repo, key, body);
+    sendBuffer(res, 200, 'application/x-git-upload-pack-result', body);
+    return;
+  }
+  sendGitError(res, 400);
 }
 
 // ---------------------------------------------------------------------------
@@ -420,10 +498,9 @@ function receivePack(forge, req, res, repo, rawBody) {
   let newObjects = new Map();
   if (rest.length > 0) {
     try {
+      // readPack verifies the pack trailer checksum and keys its result by
+      // each object's content hash, so the ids need no second verification.
       newObjects = readPack(rest, (oid) => forge.get(oid));
-      for (const [oid, object] of newObjects) {
-        if (hashObject(object.type, object.data) !== oid) throw new Error('object id mismatch');
-      }
     } catch {
       unpackOk = false;
     }

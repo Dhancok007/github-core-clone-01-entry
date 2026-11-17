@@ -92,6 +92,7 @@ export class Forge {
       labels: new Map(), // name -> {name, color}
       nextNumber: 1, // issues and pulls share one sequence, as on GitHub
       createdAt: this.isoNow(),
+      respCache: new Map(), // git HTTP response cache (see githttp.ts)
     };
     this.repos.set(name, repo);
     return repo;
